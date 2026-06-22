@@ -11,265 +11,274 @@ import java.nio.file.Path
 import kotlin.reflect.KClass
 
 /**
- * Main Nexus dependency injection container.
- * Manages component lifecycle, dependency resolution, bean creation,
- * and optional coroutine infrastructure.
- *
- * Platform-specific command registration (e.g. Paper Brigadier) is handled via
- * extension functions in the platform module (e.g. nexus-paper's registerPaperCommands).
+ * An active Nexus dependency injection context.
+ * Use [prepare] to inspect verification before activation, or [create] for the
+ * compatible one-call prepare/verify/activate path.
  */
-class NexusContext private constructor(
+class NexusContext internal constructor(
     private val classLoader: ClassLoader?,
-    private val contextName: String
+    private val contextName: String,
+    internal val verificationReceipt: VerificationReceipt? = null
 ) {
-
     private val registry = ComponentRegistry()
     private val factory = BeanFactory(registry)
-    private val scanner = ComponentScanner()
-    private var initialized = false
+    private var active = false
+    private var closed = false
 
-    /**
-     * Coroutine dispatchers backed by virtual threads.
-     * Only available if a classLoader was provided at creation time.
-     */
-    val dispatchers: NexusDispatchers? = classLoader?.let {
-        NexusDispatchers(it, contextName)
-    }
-
-    /**
-     * Plugin-scoped CoroutineScope using SupervisorJob and virtual threads.
-     * Only available if a classLoader was provided at creation time.
-     *
-     * All plugin coroutines should be launched in this scope to ensure:
-     * - Automatic cancellation on context close
-     * - Structured concurrency with SupervisorJob
-     * - Correct classloader propagation to virtual threads
-     */
-    val scope: CoroutineScope? = dispatchers?.let {
-        createNexusScope(it, contextName)
-    }
+    val dispatchers: NexusDispatchers? = classLoader?.let { NexusDispatchers(it, contextName) }
+    val scope: CoroutineScope? = dispatchers?.let { createNexusScope(it, contextName) }
 
     companion object {
-        /**
-         * Create a new NexusContext by scanning the classpath for annotated components.
-         *
-         * Discovers all classes in [basePackage] (and sub-packages) annotated with
-         * @Component, @Service, or @Repository using ClassGraph.
-         *
-         * If [configDirectory] is provided, also discovers @ConfigFile classes,
-         * loads them via ConfigManager, and registers them as singleton beans.
-         *
-         * @param basePackage Base package to scan for components
-         * @param classLoader The classloader to scan (required — typically the plugin's classloader)
-         * @param configDirectory Directory for config files (enables @ConfigFile auto-discovery)
-         * @param contextName Name for the context (used in thread names and coroutine debugging)
-         * @param externalBeans Pre-built instances to register before component scanning
-         *        (e.g. mapOf("plugin" to pluginInstance))
-         */
+        /** Scan and verify a context without instantiating scanned components. */
+        fun prepare(
+            basePackage: String,
+            classLoader: ClassLoader,
+            configDirectory: Path? = null,
+            contextName: String = "nexus",
+            externalBeans: Map<String, Any> = emptyMap()
+        ): ContextCandidate {
+            val definitions = mutableListOf<BeanDefinition>()
+            definitions += infrastructureDefinitions()
+            externalBeans.toSortedMap().forEach { (name, instance) ->
+                definitions += BeanDefinition(
+                    name, instance::class, ScopeType.SINGLETON, BeanOrigin.EXTERNAL_INSTANCE, { instance }
+                )
+            }
+            if (configDirectory != null) {
+                val manager = ConfigManager(configDirectory)
+                definitions += BeanDefinition(
+                    "configManager", ConfigManager::class, factory = { manager }, origin = BeanOrigin.CONFIGURATION
+                )
+                ComponentScanner().scanConfigFiles(basePackage, classLoader)
+                    .sortedBy { it.qualifiedName }
+                    .forEach { configClass ->
+                        val instance = manager.load(configClass)
+                        val name = configClass.simpleName!!.replaceFirstChar { it.lowercase() }
+                        definitions += BeanDefinition(
+                            name, configClass, ScopeType.SINGLETON, BeanOrigin.CONFIGURATION, { instance }
+                        )
+                    }
+            }
+            definitions += ComponentScanner().scan(basePackage, classLoader)
+                .sortedWith(compareBy({ it.name }, { it.type.qualifiedName }))
+                .map { it.copy(origin = BeanOrigin.SCANNED_COMPONENT) }
+            return ContextCandidate(classLoader, contextName, definitions)
+        }
+
+        /** Prepare, verify and activate a scanned context. */
         fun create(
             basePackage: String,
             classLoader: ClassLoader,
             configDirectory: Path? = null,
             contextName: String = "nexus",
             externalBeans: Map<String, Any> = emptyMap()
-        ): NexusContext {
+        ): NexusContext = prepare(
+            basePackage, classLoader, configDirectory, contextName, externalBeans
+        ).activate()
+
+        /** Create an active context for compatible manual registration. */
+        fun create(classLoader: ClassLoader? = null, contextName: String = "nexus"): NexusContext {
             val context = NexusContext(classLoader, contextName)
-            context.registerCoroutineBeans()
-            // Register caller-provided external beans before scanning
-            for ((name, instance) in externalBeans) {
-                @Suppress("UNCHECKED_CAST")
-                context.registerBean(name, instance::class as KClass<Any>, instance)
-            }
-            if (configDirectory != null) {
-                context.loadAndRegisterConfigs(basePackage, classLoader, configDirectory)
-            }
-            context.initialize(basePackage, classLoader)
+            context.registerRuntimeInfrastructure()
+            context.active = true
             return context
         }
 
-        /**
-         * Create a new NexusContext with manual bean registration only.
-         * Use [registerBean] to add beans after creation.
-         */
-        fun create(
-            classLoader: ClassLoader? = null,
-            contextName: String = "nexus"
-        ): NexusContext {
-            val context = NexusContext(classLoader, contextName)
-            context.registerCoroutineBeans()
-            return context
+        private fun infrastructureDefinitions(): List<BeanDefinition> = listOf(
+            BeanDefinition(
+                "nexusDispatchers", NexusDispatchers::class, factory = { error("runtime infrastructure") },
+                origin = BeanOrigin.INFRASTRUCTURE
+            ),
+            BeanDefinition(
+                "nexusScope", CoroutineScope::class, factory = { error("runtime infrastructure") },
+                origin = BeanOrigin.INFRASTRUCTURE
+            )
+        )
+    }
+
+    internal fun activate(definitions: List<BeanDefinition>, receipt: VerificationReceipt): NexusContext {
+        check(receipt.accepted) { "A rejected candidate cannot activate" }
+        val runtimeDefinitions = definitions.sortedBy { it.name }.associate { definition ->
+            val runtimeDefinition = if (definition.origin == BeanOrigin.SCANNED_COMPONENT) {
+                definition.copy(factory = factory.createFactory(definition.type))
+            } else {
+                definition
+            }
+            definition.name to runtimeDefinition
+        }
+        val progress = ActivationProgress()
+        try {
+            runtimeDefinitions.values.filterNot { it.origin == BeanOrigin.INFRASTRUCTURE }
+                .forEach(registry::register)
+            registerRuntimeInfrastructure()
+            installPreparedSingletons(receipt, runtimeDefinitions, progress)
+            activateScannedSingletons(receipt, progress)
+            progress.currentComponent = null
+            active = true
+            return this
+        } catch (failure: Throwable) {
+            progress.currentComponent?.takeUnless { it in progress.failed }?.let(progress.failed::add)
+            val managedNames = runtimeDefinitions.values
+                .filterNot { it.origin == BeanOrigin.INFRASTRUCTURE }
+                .mapTo(mutableSetOf()) { it.name }
+            progress.cleaned += cleanup(receipt.shutdownOrder.filter { it in managedNames })
+            scope?.cancel("NexusContext activation failed")
+            dispatchers?.shutdown()
+            registry.clear()
+            closed = true
+            throw ContextActivationException(
+                "Nexus context activation failed at '${progress.failed.lastOrNull() ?: "unknown"}'",
+                failure,
+                receipt,
+                progress.constructed.toList(),
+                progress.activated.toList(),
+                progress.failed.toList(),
+                progress.cleaned.distinct()
+            )
         }
     }
 
-    /**
-     * Register the coroutine scope and dispatchers as injectable beans.
-     */
-    private fun registerCoroutineBeans() {
-        dispatchers?.let { d ->
-            registerBean("nexusDispatchers", NexusDispatchers::class, d)
-        }
-        scope?.let { s ->
-            registerBean("nexusScope", CoroutineScope::class, s)
-        }
-    }
-
-    /**
-     * Scan for @ConfigFile classes, load them via ConfigManager, and register as beans.
-     *
-     * Called before initialize() so config beans are available for injection
-     * when component factories are resolved.
-     */
-    private fun loadAndRegisterConfigs(
-        basePackage: String,
-        classLoader: ClassLoader,
-        configDirectory: Path
+    private fun installPreparedSingletons(
+        receipt: VerificationReceipt,
+        definitions: Map<String, BeanDefinition>,
+        progress: ActivationProgress
     ) {
-        val manager = ConfigManager(configDirectory)
+        receipt.activationOrder.mapNotNull(definitions::get)
+            .filter { it.origin != BeanOrigin.SCANNED_COMPONENT && it.origin != BeanOrigin.INFRASTRUCTURE }
+            .filter { it.scope == ScopeType.SINGLETON }
+            .forEach { definition ->
+                progress.currentComponent = definition.name
+                val instance = definition.factory()
+                progress.constructed += definition.name
+                registry.putSingleton(definition.name, instance)
+                progress.activated += definition.name
+            }
+    }
 
-        // Register ConfigManager as a bean (so services can inject it for reload)
-        registerBean("configManager", ConfigManager::class, manager)
+    private fun activateScannedSingletons(receipt: VerificationReceipt, progress: ActivationProgress) {
+        receipt.activationOrder.mapNotNull(registry::getDefinition)
+            .filter { it.origin == BeanOrigin.SCANNED_COMPONENT && it.scope == ScopeType.SINGLETON }
+            .forEach { definition ->
+                progress.currentComponent = definition.name
+                try {
+                    factory.activateSingleton(definition.name)
+                    progress.constructed += definition.name
+                    progress.activated += definition.name
+                } catch (failure: SingletonActivationException) {
+                    progress.constructed += failure.beanName
+                    progress.failed += failure.beanName
+                    if (failure.cleanupSucceeded) progress.cleaned += failure.beanName
+                    throw failure
+                }
+            }
+    }
 
-        // Scan for @ConfigFile classes and load each one
-        val configClasses = scanner.scanConfigFiles(basePackage, classLoader)
-        for (configClass in configClasses) {
-            val instance = manager.load(configClass)
-            val beanName = configClass.simpleName!!.replaceFirstChar { it.lowercase() }
-            val definition = BeanDefinition(
-                name = beanName,
-                type = configClass,
-                scope = ScopeType.SINGLETON,
-                factory = { instance }
-            )
-            registry.register(definition)
-            registry.putSingleton(beanName, instance)
+    private fun registerRuntimeInfrastructure() {
+        dispatchers?.let {
+            registry.replace(BeanDefinition(
+                "nexusDispatchers", NexusDispatchers::class, factory = { it }, origin = BeanOrigin.INFRASTRUCTURE
+            ))
+            registry.putSingleton("nexusDispatchers", it)
+        }
+        scope?.let {
+            registry.replace(BeanDefinition(
+                "nexusScope", CoroutineScope::class, factory = { it }, origin = BeanOrigin.INFRASTRUCTURE
+            ))
+            registry.putSingleton("nexusScope", it)
         }
     }
 
-    /**
-     * Initialize the context by scanning the classpath for annotated components.
-     */
-    private fun initialize(basePackage: String, classLoader: ClassLoader) {
-        if (initialized) {
-            throw IllegalStateException("Context already initialized")
-        }
-
-        // Scan classpath for annotated component definitions
-        val definitions = scanner.scan(basePackage, classLoader)
-
-        // Register all definitions (but don't create instances yet — factories are lazy)
-        definitions.forEach { definition ->
-            val updatedDefinition = definition.copy(
-                factory = factory.createFactory(definition.type)
-            )
-            registry.register(updatedDefinition)
-        }
-
-        initialized = true
-    }
-
-    /**
-     * Get a bean by name.
-     */
     fun getBean(name: String): Any {
-        ensureInitialized()
+        ensureActive()
         return factory.getBean(name)
     }
 
-    /**
-     * Get a bean by type.
-     */
     fun <T : Any> getBean(type: KClass<T>): T {
-        ensureInitialized()
+        ensureActive()
         return factory.getBean(type)
     }
 
-    /**
-     * Get a bean by type (reified version for easier usage).
-     */
-    inline fun <reified T : Any> getBean(): T {
-        return getBean(T::class)
-    }
+    inline fun <reified T : Any> getBean(): T = getBean(T::class)
 
-    /**
-     * Manually register a singleton bean instance with the context.
-     */
     fun <T : Any> registerBean(name: String, type: KClass<T>, instance: T) {
-        val definition = BeanDefinition(
-            name = name,
-            type = type,
-            scope = ScopeType.SINGLETON,
-            factory = { instance }
-        )
-        registry.register(definition)
+        ensureActive()
+        registry.register(BeanDefinition(name, type, factory = { instance }, origin = BeanOrigin.EXTERNAL_INSTANCE))
         registry.putSingleton(name, instance)
     }
 
-    /**
-     * Manually register a bean factory.
-     */
     fun <T : Any> registerBean(
         name: String,
         type: KClass<T>,
         scope: ScopeType = ScopeType.SINGLETON,
         factory: () -> T
     ) {
-        val definition = BeanDefinition(
-            name = name,
-            type = type,
-            scope = scope,
-            factory = factory
-        )
-        registry.register(definition)
+        ensureActive()
+        registry.register(BeanDefinition(name, type, scope, BeanOrigin.MANUAL_FACTORY, factory))
     }
 
-    /**
-     * Check if a bean with the given name exists.
-     */
-    fun containsBean(name: String): Boolean {
-        return registry.contains(name)
-    }
+    fun containsBean(name: String): Boolean = registry.contains(name)
+    fun getBeanNames(): Set<String> = registry.getAllBeanNames()
 
-    /**
-     * Get all registered bean names.
-     */
-    fun getBeanNames(): Set<String> {
-        return registry.getAllBeanNames()
-    }
-
-    /**
-     * Shutdown the context.
-     *
-     * Order of operations:
-     * 1. Cancel the coroutine scope (stops all running coroutines)
-     * 2. Invoke @PreDestroy on all singletons
-     * 3. Shutdown the virtual thread executor
-     * 4. Clear the registry
-     */
+    /** Close once, destroying dependants before their dependencies. */
     fun close() {
+        if (closed) return
+        closed = true
         scope?.cancel("NexusContext closing")
-
-        registry.getAllSingletons().forEach { bean ->
-            factory.invokePreDestroy(bean)
-        }
-
+        val receiptOrder = verificationReceipt?.shutdownOrder.orEmpty()
+        val remaining = registry.getAllBeanNames().filterNot { it in receiptOrder }.sortedDescending()
+        cleanup(receiptOrder + remaining)
         dispatchers?.shutdown()
-
         registry.clear()
-        initialized = false
+        active = false
     }
 
-    /**
-     * Access to the bean factory for creating command instances.
-     * Used by command adapters to create command beans with dependency injection.
-     */
     fun getBeanFactory(): BeanFactory {
+        ensureActive()
         return factory
     }
 
-    private fun ensureInitialized() {
-        if (!initialized && registry.getAllBeanNames().isEmpty()) {
-            throw IllegalStateException("Context not initialized. Call create() or register beans manually.")
+    private fun cleanup(order: List<String>): List<String> {
+        val cleaned = mutableListOf<String>()
+        order.distinct().forEach { name ->
+            registry.removeSingleton(name)?.let { bean ->
+                if (factory.invokePreDestroy(bean)) cleaned += name
+            }
         }
-        initialized = true
+        return cleaned
     }
+
+    private fun ensureActive() {
+        check(active && !closed) { "NexusContext is not active" }
+    }
+}
+
+private class ActivationProgress {
+    val constructed = mutableListOf<String>()
+    val activated = mutableListOf<String>()
+    val failed = mutableListOf<String>()
+    val cleaned = mutableListOf<String>()
+    var currentComponent: String? = null
+}
+
+/** A verified-but-not-yet-active context and its inspectable graph receipt. */
+class ContextCandidate internal constructor(
+    private val classLoader: ClassLoader,
+    private val contextName: String,
+    definitions: List<BeanDefinition>
+) {
+    private val definitions = definitions.toList()
+    private val result = ContextVerifier.verify(this.definitions)
+    val graph: DependencyGraph get() = result.graph
+    val receipt: VerificationReceipt get() = result.receipt
+
+    /** Activate exactly once, and only when verification accepted the graph. */
+    @Synchronized
+    fun activate(): NexusContext {
+        if (!receipt.accepted) throw ContextVerificationException(receipt)
+        check(!activated) { "ContextCandidate has already been activated" }
+        activated = true
+        return NexusContext(classLoader, contextName, receipt).activate(definitions, receipt)
+    }
+
+    private var activated = false
 }
