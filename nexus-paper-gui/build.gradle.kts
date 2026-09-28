@@ -16,12 +16,12 @@ dependencies {
     api(project(":nexus-core"))
     api(project(":nexus-i18n"))
     api(project(":nexus-scheduler"))
-    api("com.github.stefvanschie.inventoryframework:IF:0.11.6")
-    compileOnly("io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT")
+    api("com.github.stefvanschie.inventoryframework:IF:0.12.2-SNAPSHOT")
+    compileOnly("io.papermc.paper:paper-api:26.2.build.129-stable")
 
     testImplementation(kotlin("test"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.0")
-    testImplementation("io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT")
+    testImplementation("io.papermc.paper:paper-api:26.2.build.129-stable")
 }
 
 tasks.test {
@@ -29,7 +29,7 @@ tasks.test {
 }
 
 kotlin {
-    jvmToolchain(21)
+    jvmToolchain(25)
 }
 
 publishing {
