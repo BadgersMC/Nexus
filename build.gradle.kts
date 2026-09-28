@@ -1,12 +1,12 @@
 plugins {
-    kotlin("jvm") version "2.0.21" apply false
-    kotlin("plugin.serialization") version "2.0.21" apply false
+    kotlin("jvm") version "2.3.20" apply false
+    kotlin("plugin.serialization") version "2.3.20" apply false
     id("io.gitlab.arturbosch.detekt") version "1.23.8" apply false
     id("com.gradle.plugin-publish") version "1.3.1" apply false
 }
 
 group = "net.badgersmc"
-version = "2.2.1"
+version = "2.3.0"
 
 /**
  * Root project is a pure multi-module aggregator. All publishable artifacts
@@ -58,5 +58,11 @@ subprojects {
         config.setFrom(rootProject.file("config/detekt/detekt.yml"))
         buildUponDefaultConfig = false
         allRules = false
+    }
+
+    // Detekt 1.23.8's embedded Kotlin compiler accepts JVM targets only through 22.
+    // This affects static analysis only; production Kotlin/Java bytecode still targets Java 25.
+    tasks.withType<io.gitlab.arturbosch.detekt.Detekt>().configureEach {
+        jvmTarget = "22"
     }
 }

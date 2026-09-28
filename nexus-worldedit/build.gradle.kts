@@ -15,7 +15,7 @@ repositories {
 
 dependencies {
     api(project(":nexus-core"))
-    compileOnly("io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT")
+    compileOnly("io.papermc.paper:paper-api:26.2.build.129-stable")
     compileOnly("com.sk89q.worldedit:worldedit-bukkit:7.3.0")
     compileOnly("com.fastasyncworldedit:FastAsyncWorldEdit-Bukkit:2.11.0")
     testImplementation(kotlin("test"))
@@ -24,7 +24,7 @@ dependencies {
 
 tasks.test { useJUnitPlatform() }
 
-kotlin { jvmToolchain(21) }
+kotlin { jvmToolchain(25) }
 
 publishing {
     publications {

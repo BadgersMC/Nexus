@@ -6,6 +6,7 @@ import com.github.stefvanschie.inventoryframework.pane.OutlinePane
 import com.github.stefvanschie.inventoryframework.pane.PaginatedPane
 import com.github.stefvanschie.inventoryframework.pane.Pane
 import com.github.stefvanschie.inventoryframework.pane.StaticPane
+import com.github.stefvanschie.inventoryframework.pane.util.Slot
 import net.badgersmc.nexus.scheduler.NexusScheduler
 import net.kyori.adventure.text.Component
 import org.bukkit.entity.Player
@@ -68,9 +69,9 @@ abstract class PaginatedListMenu<T>(
 
         gui.panes.clear()
 
-        val itemsPane = PaginatedPane(0, 0, 9, contentRows)
+        val itemsPane = PaginatedPane(9, contentRows)
         for (pageIdx in 0 until pageCount) {
-            val pagePane = OutlinePane(0, 0, 9, contentRows, Pane.Priority.LOWEST)
+            val pagePane = OutlinePane(9, contentRows, Pane.Priority.LOWEST)
             val slice = list.drop(pageIdx * itemsPerPage).take(itemsPerPage)
             for (entry in slice) {
                 pagePane.addItem(GuiItem(renderEntry(entry)) { event ->
@@ -78,16 +79,16 @@ abstract class PaginatedListMenu<T>(
                     (event.whoClicked as? Player)?.let { onEntryClick(it, entry) }
                 })
             }
-            itemsPane.addPane(pageIdx, pagePane)
+            itemsPane.addPane(pageIdx, Slot.fromXY(0, 0), pagePane)
         }
         itemsPane.page = currentPage
-        gui.addPane(itemsPane)
+        gui.addPane(Slot.fromXY(0, 0), itemsPane)
 
-        gui.addPane(buildControls(gui, pageCount, list.size))
+        gui.addPane(Slot.fromXY(0, controlRowY), buildControls(gui, pageCount, list.size))
     }
 
     private fun buildControls(gui: ChestGui, pageCount: Int, total: Int): StaticPane {
-        val pane = StaticPane(0, controlRowY, 9, 1)
+        val pane = StaticPane(9, 1)
 
         pane.addItem(GuiItem(prevIcon()) {
             it.isCancelled = true

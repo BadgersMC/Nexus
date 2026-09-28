@@ -53,8 +53,8 @@ public abstract class NexusPaperPluginLoader implements PluginLoader {
      */
     public static final List<String> STANDARD_NEXUS_LIBRARIES = Collections.unmodifiableList(List.of(
             // Kotlin runtime
-            "org.jetbrains.kotlin:kotlin-stdlib:2.0.21",
-            "org.jetbrains.kotlin:kotlin-reflect:2.0.21",
+            "org.jetbrains.kotlin:kotlin-stdlib:2.3.20",
+            "org.jetbrains.kotlin:kotlin-reflect:2.3.20",
             "org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.8.0",
 
             // Nexus stack (config + scanning + DI use these directly)
