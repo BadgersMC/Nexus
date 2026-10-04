@@ -2,6 +2,7 @@ package net.badgersmc.nexus.core
 
 import net.badgersmc.nexus.annotations.ScopeType
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentSkipListSet
 import kotlin.reflect.KClass
 
 /**
@@ -12,7 +13,7 @@ class ComponentRegistry {
 
     private val definitions = ConcurrentHashMap<String, BeanDefinition>()
     private val singletons = ConcurrentHashMap<String, Any>()
-    private val typeIndex = ConcurrentHashMap<KClass<*>, MutableList<String>>()
+    private val typeIndex = ConcurrentHashMap<KClass<*>, ConcurrentSkipListSet<String>>()
 
     /**
      * Register a bean definition with the container.
@@ -20,36 +21,23 @@ class ComponentRegistry {
      * This allows external beans registered before scanning to be overridden by
      * scanned components if they share the same name — but warns so it's not silent.
      */
+    @Synchronized
     fun register(definition: BeanDefinition) {
-        val existing = definitions.putIfAbsent(definition.name, definition)
-        if (existing != null) {
-            if (existing.type == definition.type) {
-                // Same type re-registered (e.g. config reload) — safe overwrite
-                definitions[definition.name] = definition
-            } else {
-                throw IllegalArgumentException(
-                    "Duplicate bean name '${definition.name}': " +
-                    "${existing.type.simpleName} would be overwritten by ${definition.type.simpleName}. " +
-                    "Use @Qualifier to disambiguate."
-                )
-            }
+        val existing = definitions[definition.name]
+        require(existing == null || existing.type == definition.type) {
+            "Duplicate bean name '${definition.name}': ${existing?.type?.qualifiedName} and ${definition.type.qualifiedName}"
         }
+        if (existing != null) removeIndex(existing)
+        definitions[definition.name] = definition
+        addIndex(definition)
+    }
 
-        // Index by concrete type for lookup
-        typeIndex.computeIfAbsent(definition.type) { mutableListOf() }.add(definition.name)
-
-        // Also index by all interfaces the class implements,
-        // so beans can be resolved by their interface type (e.g. PlaytimeSessionRepository)
-        for (iface in definition.type.java.interfaces) {
-            val ifaceKClass = iface.kotlin
-            typeIndex.computeIfAbsent(ifaceKClass) { mutableListOf() }.add(definition.name)
-        }
-
-        // Also index by superclass (if not Any/Object)
-        val superclass = definition.type.java.superclass
-        if (superclass != null && superclass != Any::class.java && superclass != Object::class.java) {
-            typeIndex.computeIfAbsent(superclass.kotlin) { mutableListOf() }.add(definition.name)
-        }
+    /** Atomically replace a definition and remove all of its former index edges. */
+    @Synchronized
+    fun replace(definition: BeanDefinition) {
+        definitions[definition.name]?.let(::removeIndex)
+        definitions[definition.name] = definition
+        addIndex(definition)
     }
 
     /**
@@ -92,14 +80,47 @@ class ComponentRegistry {
      * Get all registered bean names.
      */
     fun getAllBeanNames(): Set<String> {
-        return definitions.keys
+        return definitions.keys.toSortedSet()
     }
 
     /**
      * Get all singleton instances for lifecycle management.
      */
     fun getAllSingletons(): Collection<Any> {
-        return singletons.values
+        return singletons.toSortedMap().values
+    }
+
+    internal fun getAllDefinitions(): List<BeanDefinition> = definitions.values.sortedBy { it.name }
+
+    internal fun removeSingleton(name: String): Any? = singletons.remove(name)
+
+    private fun indexedTypes(type: KClass<*>): Set<KClass<*>> {
+        val result = linkedSetOf(type)
+        fun visit(javaType: Class<*>) {
+            javaType.interfaces.sortedBy { it.name }.forEach {
+                if (result.add(it.kotlin)) visit(it)
+            }
+            javaType.superclass?.takeUnless { it == Any::class.java || it == Object::class.java }?.let {
+                if (result.add(it.kotlin)) visit(it)
+            }
+        }
+        visit(type.java)
+        return result
+    }
+
+    private fun addIndex(definition: BeanDefinition) {
+        indexedTypes(definition.type).forEach { type ->
+            typeIndex.computeIfAbsent(type) { ConcurrentSkipListSet() }.add(definition.name)
+        }
+    }
+
+    private fun removeIndex(definition: BeanDefinition) {
+        indexedTypes(definition.type).forEach { type ->
+            typeIndex[type]?.let { names ->
+                names.remove(definition.name)
+                if (names.isEmpty()) typeIndex.remove(type, names)
+            }
+        }
     }
 
     /**
