@@ -39,6 +39,8 @@ class PaperCommandScanner {
         }
     }
 
+    // Multiple distinct validation failures intentionally use typed CommandExceptions.
+    @Suppress("ThrowsCount")
     internal fun processClass(klass: KClass<*>): PaperCommandDefinition {
         val annotation = klass.findAnnotation<Command>()
             ?: throw CommandException("Class ${klass.simpleName} missing @Command")
@@ -78,9 +80,9 @@ class PaperCommandScanner {
                 // cannot be invoked when Brigadier omits that argument.
                 parameters.forEachIndexed { index, parameter ->
                     val reflected = method.parameters[index + 1]
-                    if (parameter.isOptional && !reflected.isOptional && !reflected.type.isMarkedNullable
-                        && parameter.argAnnotation?.defaultValue.isNullOrEmpty()
-                    ) {
+                    val hasKotlinDefault = reflected.isOptional || reflected.type.isMarkedNullable
+                    val hasAnnotationDefault = !parameter.argAnnotation?.defaultValue.isNullOrEmpty()
+                    if (parameter.isOptional && !hasKotlinDefault && !hasAnnotationDefault) {
                         throw CommandException("Optional '${parameter.name}' needs a Kotlin default, nullable type or @Arg defaultValue")
                     }
                 }

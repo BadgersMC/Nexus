@@ -16,6 +16,8 @@ internal object PaperCommandPlanner {
         val definitions: List<PaperCommandDefinition>
     )
 
+    // Root validation rejects distinct configuration errors rather than masking conflicts.
+    @Suppress("ThrowsCount")
     fun plan(definitions: List<PaperCommandDefinition>): List<Root> {
         val roots = definitions.groupBy { it.annotation.name.lowercase() }
         val occupiedNames = mutableMapOf<String, String>()

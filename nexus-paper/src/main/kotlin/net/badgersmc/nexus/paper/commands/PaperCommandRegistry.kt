@@ -180,29 +180,39 @@ class PaperCommandRegistry(
         val values = linkedMapOf<KParameter, Any?>(method.parameters.first() to route.bean)
         sub.parameters.forEachIndexed { index, param ->
             val reflected = method.parameters[index + 1]
-            when {
-                param.isContext -> values[reflected] = when (param.type.simpleName) {
-                    "CommandSourceStack" -> ctx.source
-                    "Player" -> ctx.source.sender as? Player
-                        ?: throw CommandException("Command requires a player sender")
-                    "CommandSender" -> ctx.source.sender
-                    "Server" -> ctx.source.sender.server
-                    else -> throw CommandException("Unsupported @Context type '${param.type.simpleName}'")
+            if (param.isContext) {
+                values[reflected] = contextValue(ctx.source, param.type.simpleName)
+            } else {
+                when {
+                    hasArgument(ctx, param.name) ->
+                        values[reflected] = providedValue(ctx, param)
+                    !param.argAnnotation?.defaultValue.isNullOrEmpty() ->
+                        values[reflected] = parseDefault(param.type, param.argAnnotation!!.defaultValue)
+                    reflected.isOptional -> Unit // Kotlin callBy applies the method default
+                    reflected.type.isMarkedNullable -> values[reflected] = null
+                    else -> throw CommandException("Missing required argument '${param.name}'")
                 }
-                param.isArg && hasArgument(ctx, param.name) -> {
-                    val resolver = PaperArgumentResolvers.get(param.type)
-                        ?: throw CommandException("No resolver for ${param.type.simpleName}")
-                    values[reflected] = resolver.extract(ctx, param.name)
-                }
-                param.isArg && !param.argAnnotation?.defaultValue.isNullOrEmpty() -> {
-                    values[reflected] = parseDefault(param.type, param.argAnnotation!!.defaultValue)
-                }
-                param.isArg && reflected.isOptional -> Unit // Kotlin callBy applies method default
-                param.isArg && reflected.type.isMarkedNullable -> values[reflected] = null
-                else -> throw CommandException("Missing required argument '${param.name}'")
             }
         }
         return values
+    }
+
+    private fun contextValue(source: CommandSourceStack, typeName: String?): Any = when (typeName) {
+        "CommandSourceStack" -> source
+        "Player" -> source.sender as? Player
+            ?: throw CommandException("Command requires a player sender")
+        "CommandSender" -> source.sender
+        "Server" -> source.sender.server
+        else -> throw CommandException("Unsupported @Context type '$typeName'")
+    }
+
+    private fun providedValue(
+        ctx: CommandContext<CommandSourceStack>,
+        param: net.badgersmc.nexus.commands.CommandParameter
+    ): Any {
+        val resolver = PaperArgumentResolvers.get(param.type)
+            ?: throw CommandException("No resolver for ${param.type.simpleName}")
+        return resolver.extract(ctx, param.name)
     }
 
     private fun hasArgument(ctx: CommandContext<CommandSourceStack>, name: String): Boolean =
