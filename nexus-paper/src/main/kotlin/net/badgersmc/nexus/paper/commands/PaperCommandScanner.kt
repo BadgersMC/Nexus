@@ -7,6 +7,7 @@ import net.badgersmc.nexus.commands.annotations.Arg
 import net.badgersmc.nexus.commands.annotations.Command
 import net.badgersmc.nexus.commands.annotations.Context
 import net.badgersmc.nexus.paper.commands.annotations.Async
+import net.badgersmc.nexus.paper.commands.annotations.Greedy
 import net.badgersmc.nexus.paper.commands.annotations.Permission
 import net.badgersmc.nexus.paper.commands.annotations.PlayerOnly
 import net.badgersmc.nexus.paper.commands.annotations.Subcommand
@@ -34,11 +35,11 @@ class PaperCommandScanner {
             }
 
         return commandClasses.map { processClass(it) }.also { list ->
-            logger.info("Discovered {} Paper commands in package '{}'", list.size, basePackage)
+            logger.info("Discovered {} Paper command classes in package '{}'", list.size, basePackage)
         }
     }
 
-    private fun processClass(klass: KClass<*>): PaperCommandDefinition {
+    internal fun processClass(klass: KClass<*>): PaperCommandDefinition {
         val annotation = klass.findAnnotation<Command>()
             ?: throw CommandException("Class ${klass.simpleName} missing @Command")
 
@@ -46,6 +47,7 @@ class PaperCommandScanner {
             .filter { it.hasAnnotation<Subcommand>() }
             .map { method ->
                 val subAnnotation = method.findAnnotation<Subcommand>()!!
+                // Empty @Subcommand("") is the root/default route.
                 val path = subAnnotation.value.trim().split(" ").filter { it.isNotEmpty() }
                 val permission = method.findAnnotation<Permission>()?.value
                     ?: annotation.permission.ifEmpty { null }
@@ -53,12 +55,40 @@ class PaperCommandScanner {
                 val isAsync = method.hasAnnotation<Async>() || method.isSuspend
 
                 val suggestionsMap = mutableMapOf<String, String>()
-                val parameters = method.parameters.drop(1) // skip 'this'
+                val greedyParameters = mutableSetOf<String>()
+                val parameters = method.parameters.drop(1)
                     .mapIndexed { idx, param ->
-                        buildParameter(klass, method, param, idx, suggestionsMap)
+                        val result = buildParameter(klass, method, param, idx, suggestionsMap)
+                        if (param.hasAnnotation<Greedy>()) {
+                            if (!result.isArg || result.type != String::class) {
+                                throw CommandException("@Greedy requires a String @Arg in ${klass.simpleName}::${method.name}")
+                            }
+                            greedyParameters.add(result.name)
+                        }
+                        result
                     }
+                val args = parameters.filter { it.isArg }
+                if (args.dropLast(1).any { it.name in greedyParameters }) {
+                    throw CommandException("@Greedy must be the final @Arg in ${klass.simpleName}::${method.name}")
+                }
+                if (args.dropLastWhile { it.isOptional }.any { it.isOptional }) {
+                    throw CommandException("Required @Arg after optional @Arg in ${klass.simpleName}::${method.name}")
+                }
+                // Non-null optional parameters without a Kotlin default or annotation default
+                // cannot be invoked when Brigadier omits that argument.
+                parameters.forEachIndexed { index, parameter ->
+                    val reflected = method.parameters[index + 1]
+                    if (parameter.isOptional && !reflected.isOptional && !reflected.type.isMarkedNullable
+                        && parameter.argAnnotation?.defaultValue.isNullOrEmpty()
+                    ) {
+                        throw CommandException("Optional '${parameter.name}' needs a Kotlin default, nullable type or @Arg defaultValue")
+                    }
+                }
 
-                PaperSubcommandDefinition(path, method, parameters, permission, isPlayerOnly, isAsync, suggestionsMap)
+                PaperSubcommandDefinition(
+                    path, method, parameters, permission, isPlayerOnly, isAsync,
+                    suggestionsMap, greedyParameters
+                )
             }
 
         if (subcommands.isEmpty()) throw CommandException(
@@ -87,11 +117,12 @@ class PaperCommandScanner {
                     "in ${klass.simpleName}::${method.name}"
             )
         }
+        val name = arg?.name?.takeIf { it.isNotBlank() } ?: param.name ?: "param$idx"
         if (suggests != null && arg != null) {
-            suggestionsMap[param.name ?: "param$idx"] = suggests.value
+            suggestionsMap[name] = suggests.value
         }
         return CommandParameter(
-            name = param.name ?: "param$idx",
+            name = name,
             type = param.type.classifier as KClass<*>,
             index = idx,
             argAnnotation = arg,
